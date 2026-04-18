@@ -1,9 +1,29 @@
 import 'package:flutter/material.dart';
+import 'package:gestcare_app/app_session.dart';
+import 'package:gestcare_app/backend_api.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:gestcare_app/home_dashboard_data_source.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await AppSession.init();
   runApp(const GestCareApp());
+}
+
+String _formatBrazilianDate(DateTime date) {
+  final normalized = DateTime(date.year, date.month, date.day);
+  final day = normalized.day.toString().padLeft(2, '0');
+  final month = normalized.month.toString().padLeft(2, '0');
+  return '$day/$month/${normalized.year}';
+}
+
+Future<void> _syncAuthenticatedProfile(BackendApi api, String token) async {
+  final profile = await api.profile(token);
+  await AppSession.saveProfile(
+    name: profile.name,
+    email: profile.email,
+    dueDate: profile.birthDate,
+  );
 }
 
 class GestCareColors {
@@ -43,10 +63,11 @@ class GestCareApp extends StatelessWidget {
           surface: Colors.white,
         ),
       ),
-      initialRoute: '/',
+      initialRoute: AppSession.isAuthenticated ? '/home' : '/',
       routes: {
         '/': (context) => const WelcomeScreen(),
         '/signup': (context) => const SignupScreen(),
+        '/login': (context) => const LoginScreen(),
         '/home': (context) => const MainAppNavigation(),
         '/questionnaire': (context) => const QuestionnaireScreen(),
         '/processing': (context) => const ProfileProcessingScreen(),
@@ -108,7 +129,7 @@ class WelcomeScreen extends StatelessWidget {
                 ),
                 const SizedBox(height: 12),
                 OutlinedButton(
-                  onPressed: () => Navigator.pushNamed(context, '/home'),
+                  onPressed: () => Navigator.pushNamed(context, '/login'),
                   style: OutlinedButton.styleFrom(
                     minimumSize: const Size.fromHeight(52),
                     side: const BorderSide(color: Color(0x220C7A71)),
@@ -117,7 +138,7 @@ class WelcomeScreen extends StatelessWidget {
                     ),
                     foregroundColor: GestCareColors.textMuted,
                   ),
-                  child: const Text('Ja tenho cadastro'),
+                  child: const Text('Login'),
                 ),
                 const SizedBox(height: 18),
                 Text(
@@ -144,11 +165,12 @@ class SignupScreen extends StatefulWidget {
 }
 
 class _SignupScreenState extends State<SignupScreen> {
+  final BackendApi _api = const BackendApi();
   final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
   final TextEditingController _nameController = TextEditingController();
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _phoneController = TextEditingController();
-  final TextEditingController _dueDateController = TextEditingController();
+  final TextEditingController _birthDateController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _confirmPasswordController =
       TextEditingController();
@@ -156,6 +178,7 @@ class _SignupScreenState extends State<SignupScreen> {
   bool _hidePassword = true;
   bool _hideConfirmPassword = true;
   bool _isFormattingPhone = false;
+  bool _isSubmitting = false;
 
   static final RegExp _emailRegex = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
   static final RegExp _specialCharRegex = RegExp(r'[!@#$%^&*(),.?":{}|<>]');
@@ -208,7 +231,7 @@ class _SignupScreenState extends State<SignupScreen> {
     _nameController.dispose();
     _emailController.dispose();
     _phoneController.dispose();
-    _dueDateController.dispose();
+    _birthDateController.dispose();
     _passwordController.dispose();
     _confirmPasswordController.dispose();
     super.dispose();
@@ -259,15 +282,17 @@ class _SignupScreenState extends State<SignupScreen> {
     return second.isEmpty ? '($ddd) $first' : '($ddd) $first-$second';
   }
 
-  Future<void> _pickDueDate() async {
+  Future<void> _pickBirthDate() async {
     final now = DateTime.now();
-    final initial = now.add(const Duration(days: 120));
+    final minimumDate = DateTime(2026, 1, 1);
+    final maximumDate = DateTime(2099, 12, 31);
+    final initial = now.isBefore(minimumDate) ? minimumDate : now;
 
     final picked = await showDatePicker(
       context: context,
       initialDate: initial,
-      firstDate: now,
-      lastDate: now.add(const Duration(days: 320)),
+      firstDate: minimumDate,
+      lastDate: maximumDate,
       helpText: 'Data prevista do parto',
       cancelText: 'Cancelar',
       confirmText: 'Selecionar',
@@ -278,7 +303,31 @@ class _SignupScreenState extends State<SignupScreen> {
     final day = picked.day.toString().padLeft(2, '0');
     final month = picked.month.toString().padLeft(2, '0');
     final year = picked.year.toString();
-    _dueDateController.text = '$day/$month/$year';
+    _birthDateController.text = '$day/$month/$year';
+  }
+
+  String _toIsoDate(String brDate) {
+    final parts = brDate.split('/');
+    if (parts.length != 3) {
+      throw const FormatException('Data invalida');
+    }
+
+    final day = int.tryParse(parts[0]);
+    final month = int.tryParse(parts[1]);
+    final year = int.tryParse(parts[2]);
+
+    if (day == null || month == null || year == null || year < 2026) {
+      throw const FormatException('Data invalida');
+    }
+
+    final parsed = DateTime(year, month, day);
+    if (parsed.year != year || parsed.month != month || parsed.day != day) {
+      throw const FormatException('Data invalida');
+    }
+
+    final isoMonth = parsed.month.toString().padLeft(2, '0');
+    final isoDay = parsed.day.toString().padLeft(2, '0');
+    return '${parsed.year}-$isoMonth-$isoDay';
   }
 
   String? _validateName(String? value) {
@@ -318,15 +367,83 @@ class _SignupScreenState extends State<SignupScreen> {
     return null;
   }
 
-  void _submit() {
+  String? _validateBirthDate(String? value) {
+    final text = value?.trim() ?? '';
+    if (text.isEmpty) return 'Informe a data prevista do parto.';
+
+    final parts = text.split('/');
+    if (parts.length != 3) return 'Data invalida. Use DD/MM/AAAA.';
+
+    final day = int.tryParse(parts[0]);
+    final month = int.tryParse(parts[1]);
+    final year = int.tryParse(parts[2]);
+
+    if (day == null || month == null || year == null) {
+      return 'Data invalida. Use DD/MM/AAAA.';
+    }
+
+    if (year < 2026) {
+      return 'Use uma data a partir de 2026.';
+    }
+
+    final parsed = DateTime(year, month, day);
+    if (parsed.year != year || parsed.month != month || parsed.day != day) {
+      return 'Data invalida. Use DD/MM/AAAA.';
+    }
+
+    return null;
+  }
+
+  Future<void> _submit() async {
     final isValid = _formKey.currentState?.validate() ?? false;
-    if (!isValid) return;
+    if (!isValid || _isSubmitting) return;
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Cadastro validado com sucesso!')),
-    );
+    setState(() => _isSubmitting = true);
 
-    Navigator.pushNamedAndRemoveUntil(context, '/home', (route) => false);
+    try {
+      final birthDateIso = _toIsoDate(_birthDateController.text.trim());
+      await _api.register(
+        name: _nameController.text.trim(),
+        email: _emailController.text.trim(),
+        password: _passwordController.text,
+        birthDateIso: birthDateIso,
+      );
+
+      final loginResult = await _api.login(
+        email: _emailController.text.trim(),
+        password: _passwordController.text,
+      );
+      await AppSession.saveToken(loginResult.accessToken);
+      try {
+        await _syncAuthenticatedProfile(_api, loginResult.accessToken);
+      } catch (_) {
+        await AppSession.saveProfile(
+          name: _nameController.text.trim(),
+          email: _emailController.text.trim(),
+          dueDate: DateTime.parse(birthDateIso),
+        );
+      }
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Conta criada com sucesso!')),
+      );
+      Navigator.pushNamedAndRemoveUntil(context, '/home', (route) => false);
+    } on ApiClientException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    } on FormatException {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Data prevista do parto invalida.')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isSubmitting = false);
+      }
+    }
   }
 
   @override
@@ -392,16 +509,17 @@ class _SignupScreenState extends State<SignupScreen> {
                 ),
               ),
               LabeledField(
-                label: 'Data prevista do parto (opcional)',
+                label: 'Data prevista do parto',
                 child: TextFormField(
-                  controller: _dueDateController,
+                  controller: _birthDateController,
                   readOnly: true,
-                  onTap: _pickDueDate,
+                  onTap: _pickBirthDate,
                   textInputAction: TextInputAction.next,
+                  validator: _validateBirthDate,
                   decoration: InputDecoration(
-                    hintText: 'Selecione uma data',
+                    hintText: 'Ex: 20/09/2026',
                     suffixIcon: IconButton(
-                      onPressed: _pickDueDate,
+                      onPressed: _pickBirthDate,
                       icon: const Icon(Icons.calendar_month),
                     ),
                   ),
@@ -510,7 +628,12 @@ class _SignupScreenState extends State<SignupScreen> {
                 ),
               ),
               const SizedBox(height: 8),
-              PrimaryButton(label: 'Finalizar Cadastro', onPressed: _submit),
+              PrimaryButton(
+                label: _isSubmitting
+                    ? 'Cadastrando...'
+                    : 'Finalizar Cadastro',
+                onPressed: _isSubmitting ? () {} : _submit,
+              ),
               const SizedBox(height: 10),
               OutlinedButton(
                 onPressed: () => Navigator.pop(context),
@@ -518,6 +641,159 @@ class _SignupScreenState extends State<SignupScreen> {
                   minimumSize: const Size.fromHeight(52),
                 ),
                 child: const Text('Voltar'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final BackendApi _api = const BackendApi();
+  final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
+  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _passwordController = TextEditingController();
+
+  bool _hidePassword = true;
+  bool _isLoading = false;
+
+  static final RegExp _emailRegex = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  String? _validateEmail(String? value) {
+    final text = value?.trim() ?? '';
+    if (text.isEmpty) return 'Informe seu e-mail.';
+    if (!_emailRegex.hasMatch(text)) return 'E-mail invalido.';
+    return null;
+  }
+
+  String? _validatePassword(String? value) {
+    final text = value ?? '';
+    if (text.isEmpty) return 'Informe sua senha.';
+    if (text.length < 6) return 'Senha invalida.';
+    return null;
+  }
+
+  Future<void> _signIn() async {
+    final isValid = _formKey.currentState?.validate() ?? false;
+    if (!isValid || _isLoading) return;
+
+    setState(() => _isLoading = true);
+    try {
+      final result = await _api.login(
+        email: _emailController.text.trim(),
+        password: _passwordController.text,
+      );
+      await AppSession.saveToken(result.accessToken);
+      try {
+        await _syncAuthenticatedProfile(_api, result.accessToken);
+      } catch (_) {
+        // Mantem a sessao autenticada mesmo se o perfil nao puder ser carregado neste momento.
+      }
+
+      if (!mounted) return;
+      Navigator.pushNamedAndRemoveUntil(context, '/home', (route) => false);
+    } on ApiClientException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Entrar'),
+        backgroundColor: Colors.transparent,
+      ),
+      body: SafeArea(
+        child: Form(
+          key: _formKey,
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+            children: [
+              Text(
+                'Bem-vinda de volta',
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Entre com seu e-mail e senha para continuar sua jornada.',
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: GestCareColors.textMuted,
+                ),
+              ),
+              const SizedBox(height: 18),
+              LabeledField(
+                label: 'E-mail',
+                child: TextFormField(
+                  controller: _emailController,
+                  keyboardType: TextInputType.emailAddress,
+                  textInputAction: TextInputAction.next,
+                  validator: _validateEmail,
+                  decoration: const InputDecoration(
+                    hintText: 'seuemail@exemplo.com',
+                  ),
+                ),
+              ),
+              LabeledField(
+                label: 'Senha',
+                child: TextFormField(
+                  controller: _passwordController,
+                  obscureText: _hidePassword,
+                  textInputAction: TextInputAction.done,
+                  validator: _validatePassword,
+                  onFieldSubmitted: (_) => _signIn(),
+                  decoration: InputDecoration(
+                    hintText: 'Digite sua senha',
+                    suffixIcon: IconButton(
+                      onPressed: () {
+                        setState(() => _hidePassword = !_hidePassword);
+                      },
+                      icon: Icon(
+                        _hidePassword ? Icons.visibility : Icons.visibility_off,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 12),
+              PrimaryButton(
+                label: _isLoading ? 'Entrando...' : 'Entrar',
+                onPressed: _isLoading ? () {} : _signIn,
+              ),
+              const SizedBox(height: 10),
+              OutlinedButton(
+                onPressed: _isLoading
+                    ? null
+                    : () => Navigator.pushNamed(context, '/signup'),
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size.fromHeight(52),
+                ),
+                child: const Text('Criar conta'),
               ),
             ],
           ),
@@ -605,7 +881,7 @@ class _MainAppNavigationState extends State<MainAppNavigation> {
 
 class HomeDashboardScreen extends StatefulWidget {
   const HomeDashboardScreen({
-    this.dataSource = const MockHomeDashboardDataSource(),
+    this.dataSource = const ApiHomeDashboardDataSource(),
     super.key,
   });
 
@@ -749,7 +1025,7 @@ class _HomeGreetingHeader extends StatelessWidget {
                 ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
               ),
               Text(
-                '${currentWeek} semanas de gestação',
+                '$currentWeek semanas de gestação',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
                   color: GestCareColors.textMuted,
                 ),
@@ -1378,8 +1654,50 @@ class _ConsultationTile extends StatelessWidget {
   }
 }
 
-class ProfileSettingsScreen extends StatelessWidget {
+class ProfileSettingsScreen extends StatefulWidget {
   const ProfileSettingsScreen({super.key});
+
+  @override
+  State<ProfileSettingsScreen> createState() => _ProfileSettingsScreenState();
+}
+
+class _ProfileSettingsScreenState extends State<ProfileSettingsScreen> {
+  final BackendApi _api = const BackendApi();
+
+  bool _isLoading = true;
+  String _name = 'Gestante';
+  String _email = '';
+  DateTime? _dueDate;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadProfile();
+  }
+
+  Future<void> _loadProfile() async {
+    try {
+      if (!AppSession.hasProfile && AppSession.token != null) {
+        await _syncAuthenticatedProfile(_api, AppSession.token!);
+      }
+
+      setState(() {
+        _name = AppSession.profileName ?? _name;
+        _email = AppSession.profileEmail ?? _email;
+        _dueDate = AppSession.dueDate;
+      });
+    } catch (_) {
+      setState(() {
+        _name = AppSession.profileName ?? _name;
+        _email = AppSession.profileEmail ?? _email;
+        _dueDate = AppSession.dueDate;
+      });
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
 
   Future<void> _confirmLogout(BuildContext context) async {
     final shouldLogout = await showDialog<bool>(
@@ -1402,13 +1720,183 @@ class ProfileSettingsScreen extends StatelessWidget {
       },
     );
 
-    if (shouldLogout == true && context.mounted) {
+    if (shouldLogout == true) {
+      await AppSession.clear();
+      if (!context.mounted) return;
       Navigator.pushNamedAndRemoveUntil(context, '/', (route) => false);
     }
   }
 
+  Future<void> _openEditProfileDialog() async {
+    final nameController = TextEditingController(text: _name);
+    final emailController = TextEditingController(text: _email);
+    DateTime? selectedDueDate = _dueDate;
+    final formKey = GlobalKey<FormState>();
+    var isSubmitting = false;
+
+    String? validateName(String? value) {
+      final text = value?.trim() ?? '';
+      if (text.isEmpty) return 'Informe o nome.';
+      if (text.length < 3) return 'Nome muito curto.';
+      return null;
+    }
+
+    String? validateEmail(String? value) {
+      final text = value?.trim() ?? '';
+      if (text.isEmpty) return 'Informe o e-mail.';
+      if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(text)) {
+        return 'E-mail invalido.';
+      }
+      return null;
+    }
+
+    String? validateDueDate() {
+      if (selectedDueDate == null) return 'Selecione a data prevista do parto.';
+      if (selectedDueDate!.year < 2026) return 'Use uma data a partir de 2026.';
+      return null;
+    }
+
+    if (!mounted) return;
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (dialogContext, setDialogState) {
+            Future<void> pickDueDate() async {
+              final minimumDate = DateTime(2026, 1, 1);
+              final maximumDate = DateTime(2099, 12, 31);
+              final now = DateTime.now();
+              final initialDate = selectedDueDate != null &&
+                      !selectedDueDate!.isBefore(minimumDate)
+                  ? selectedDueDate!
+                  : (now.isBefore(minimumDate) ? minimumDate : now);
+
+              final picked = await showDatePicker(
+                context: dialogContext,
+                initialDate: initialDate,
+                firstDate: minimumDate,
+                lastDate: maximumDate,
+                helpText: 'Data prevista do parto',
+                cancelText: 'Cancelar',
+                confirmText: 'Selecionar',
+              );
+
+              if (picked == null) return;
+              setDialogState(() => selectedDueDate = picked);
+            }
+
+            Future<void> saveChanges() async {
+              final isValid = formKey.currentState?.validate() ?? false;
+              final dueDateError = validateDueDate();
+
+              if (!isValid || dueDateError != null || isSubmitting) {
+                if (dueDateError != null) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text(dueDateError)),
+                  );
+                }
+                return;
+              }
+
+              setDialogState(() => isSubmitting = true);
+
+              await AppSession.saveProfile(
+                name: nameController.text.trim(),
+                email: emailController.text.trim(),
+                dueDate: selectedDueDate!,
+              );
+
+              if (!mounted) return;
+              setState(() {
+                _name = AppSession.profileName ?? _name;
+                _email = AppSession.profileEmail ?? _email;
+                _dueDate = AppSession.dueDate;
+              });
+              if (dialogContext.mounted) {
+                Navigator.pop(dialogContext);
+              }
+            }
+
+            return AlertDialog(
+              title: const Text('Editar perfil'),
+              content: SingleChildScrollView(
+                child: Form(
+                  key: formKey,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextFormField(
+                        controller: nameController,
+                        validator: validateName,
+                        decoration: const InputDecoration(
+                          labelText: 'Nome',
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextFormField(
+                        controller: emailController,
+                        validator: validateEmail,
+                        keyboardType: TextInputType.emailAddress,
+                        decoration: const InputDecoration(
+                          labelText: 'E-mail',
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      InkWell(
+                        onTap: pickDueDate,
+                        child: InputDecorator(
+                          decoration: InputDecoration(
+                            labelText: 'Data prevista do parto',
+                            errorText: validateDueDate(),
+                          ),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                selectedDueDate == null
+                                    ? 'Selecionar data'
+                                    : _formatBrazilianDate(selectedDueDate!),
+                              ),
+                              const Icon(Icons.calendar_month),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: isSubmitting
+                      ? null
+                      : () => Navigator.pop(dialogContext),
+                  child: const Text('Cancelar'),
+                ),
+                TextButton(
+                  onPressed: isSubmitting ? null : saveChanges,
+                  child: Text(isSubmitting ? 'Salvando...' : 'Salvar'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    final currentWeek = AppSession.currentWeek ?? 24;
+    final daysToBirth = AppSession.daysToBirth ?? 112;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Meu Perfil'),
@@ -1437,43 +1925,53 @@ class ProfileSettingsScreen extends StatelessWidget {
                   ),
                   const SizedBox(height: 12),
                   Text(
-                    'Ana Clara Sousa',
+                    _name,
+                    textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.titleMedium?.copyWith(
                       fontWeight: FontWeight.w700,
                     ),
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    'ana.sousa@email.com',
+                    _email,
+                    textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
                       color: GestCareColors.textMuted,
                     ),
+                  ),
+                  const SizedBox(height: 14),
+                  OutlinedButton.icon(
+                    onPressed: _openEditProfileDialog,
+                    icon: const Icon(Icons.edit),
+                    label: const Text('Editar perfil'),
                   ),
                 ],
               ),
             ),
             const SizedBox(height: 24),
             Text(
-              'Dados Pessoais',
+              'Gestacao atual',
               style: Theme.of(
                 context,
               ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 12),
             _SettingRow(
-              icon: Icons.cake,
-              title: 'Data de Nascimento',
-              subtitle: '12 de Janeiro de 1995',
+              icon: Icons.calendar_month,
+              title: 'Data prevista do parto',
+              subtitle: _dueDate == null
+                  ? 'Nao informada'
+                  : _formatBrazilianDate(_dueDate!),
             ),
             _SettingRow(
-              icon: Icons.phone,
-              title: 'Telefone',
-              subtitle: '(11) 9 9999-8888',
+              icon: Icons.timeline,
+              title: 'Semanas de gestacao',
+              subtitle: '$currentWeek semanas',
             ),
             _SettingRow(
-              icon: Icons.location_on,
-              title: 'Endereco',
-              subtitle: 'Sao Paulo, SP',
+              icon: Icons.hourglass_bottom,
+              title: 'Dias para o parto',
+              subtitle: '$daysToBirth dias',
             ),
             const SizedBox(height: 24),
             Text(
@@ -1866,7 +2364,7 @@ class BabyWeekPlannerScreen extends StatefulWidget {
 class _BabyWeekPlannerScreenState extends State<BabyWeekPlannerScreen> {
   final TextEditingController _taskController = TextEditingController();
 
-  int _currentWeek = 24;
+  int _currentWeek = AppSession.currentWeek ?? 24;
 
   bool _showAllTasks = false;
 
@@ -1886,6 +2384,28 @@ class _BabyWeekPlannerScreenState extends State<BabyWeekPlannerScreen> {
   int get _doneCount => _tasks.where((task) => task['done'] == true).length;
 
   _BabySizeInfo get _babySizeInfo => _babySizeForWeek(_currentWeek);
+  String get _trimesterLabel => _trimesterForWeek(_currentWeek);
+  String get _babySizeHeadline {
+    if (_babySizeInfo.article == 'em') {
+      return 'Seu bebe esta em ${_babySizeInfo.name}!';
+    }
+
+    return 'Seu bebe tem o\ntamanho de ${_babySizeInfo.article} ${_babySizeInfo.name}!';
+  }
+
+  int get _daysToBirthDisplay {
+    final sessionWeek = AppSession.currentWeek;
+    final sessionDaysToBirth = AppSession.daysToBirth;
+
+    if (sessionWeek != null &&
+        sessionDaysToBirth != null &&
+        _currentWeek == sessionWeek) {
+      return sessionDaysToBirth;
+    }
+
+    final estimated = 280 - (_currentWeek * 7);
+    return estimated < 0 ? 0 : estimated;
+  }
 
   List<Map<String, dynamic>> get _visibleTasks {
     if (_showAllTasks || _tasks.length <= 3) return _tasks;
@@ -1975,12 +2495,12 @@ class _BabyWeekPlannerScreenState extends State<BabyWeekPlannerScreen> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Voce esta na ${_currentWeek}a semana',
+                        'Voce esta com $_currentWeek semanas',
                         style: Theme.of(context).textTheme.titleMedium
                             ?.copyWith(fontWeight: FontWeight.w700),
                       ),
                       Text(
-                        'Acompanhamento semanal ativo',
+                        '$_trimesterLabel / faltam $_daysToBirthDisplay dias',
                         style: Theme.of(context).textTheme.bodySmall?.copyWith(
                           color: GestCareColors.textMuted,
                         ),
@@ -2008,9 +2528,9 @@ class _BabyWeekPlannerScreenState extends State<BabyWeekPlannerScreen> {
                     ),
                   ),
                   Slider(
-                    min: 4,
+                    min: 1,
                     max: 40,
-                    divisions: 36,
+                    divisions: 39,
                     activeColor: GestCareColors.deepTeal,
                     value: _currentWeek.toDouble(),
                     label: '$_currentWeek semanas',
@@ -2048,7 +2568,7 @@ class _BabyWeekPlannerScreenState extends State<BabyWeekPlannerScreen> {
                         ),
                         const SizedBox(height: 8),
                         Text(
-                          'Seu bebe tem o\ntamanho de ${_babySizeInfo.article} ${_babySizeInfo.name}!',
+                          _babySizeHeadline,
                           style: Theme.of(context).textTheme.titleLarge
                               ?.copyWith(fontWeight: FontWeight.w700),
                         ),
@@ -2058,7 +2578,61 @@ class _BabyWeekPlannerScreenState extends State<BabyWeekPlannerScreen> {
                   SizedBox(
                     width: 110,
                     height: 110,
-                    child: _FruitIllustration(info: _babySizeInfo),
+                    child: _FruitIllustration(
+                      info: _babySizeInfo,
+                      week: _currentWeek,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Column(
+                children: [
+                  Text(
+                    'Dimensoes do bebe',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: const Color(0xFF3CA055),
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _BabyDimensionItem(
+                          label: 'Comprimento',
+                          value: _babySizeInfo.lengthText,
+                          helperText: _babySizeInfo.lengthHelper,
+                        ),
+                      ),
+                      const SizedBox(
+                        height: 48,
+                        child: VerticalDivider(color: Color(0xFFE0E0E0)),
+                      ),
+                      Expanded(
+                        child: _BabyDimensionItem(
+                          label: 'Peso',
+                          value: _babySizeInfo.weightText,
+                        ),
+                      ),
+                      const SizedBox(
+                        height: 48,
+                        child: VerticalDivider(color: Color(0xFFE0E0E0)),
+                      ),
+                      Expanded(
+                        child: _BabyDimensionItem(
+                          label: 'Do tamanho de',
+                          value: _babySizeInfo.name,
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -3143,7 +3717,6 @@ class _WeeklyTaskCard extends StatelessWidget {
     required this.done,
     required this.onChanged,
   });
-
   final String title;
   final bool done;
   final ValueChanged<bool?> onChanged;
@@ -3173,10 +3746,57 @@ class _WeeklyTaskCard extends StatelessWidget {
   }
 }
 
+class _BabyDimensionItem extends StatelessWidget {
+  const _BabyDimensionItem({
+    required this.label,
+    required this.value,
+    this.helperText,
+  });
+
+  final String label;
+  final String value;
+  final String? helperText;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Text(
+          label,
+          textAlign: TextAlign.center,
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+            color: GestCareColors.textMuted,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          value,
+          textAlign: TextAlign.center,
+          style: Theme.of(
+            context,
+          ).textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w700),
+        ),
+        if (helperText != null && helperText != '-' && helperText!.isNotEmpty)
+          Text(
+            helperText!,
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+              color: GestCareColors.textMuted,
+            ),
+          ),
+      ],
+    );
+  }
+}
+
 class _BabySizeInfo {
   const _BabySizeInfo({
     required this.name,
     this.article = 'uma',
+    this.illustrationEmoji,
+    required this.lengthText,
+    this.lengthHelper = 'da cabeca ao bumbum',
+    required this.weightText,
     required this.icon,
     required this.kind,
     required this.primaryColor,
@@ -3186,6 +3806,10 @@ class _BabySizeInfo {
 
   final String name;
   final String article;
+  final String? illustrationEmoji;
+  final String lengthText;
+  final String lengthHelper;
+  final String weightText;
   final IconData icon;
   final _FruitKind kind;
   final Color primaryColor;
@@ -3194,99 +3818,565 @@ class _BabySizeInfo {
 }
 
 _BabySizeInfo _babySizeForWeek(int currentWeek) {
-  if (currentWeek <= 8) {
-    return const _BabySizeInfo(
-      name: 'Morango',
-      article: 'um',
+  const weeklyData = <int, _BabySizeInfo>{
+    1: _BabySizeInfo(
+      name: 'desenvolvimento inicial',
+      article: 'em',
+      illustrationEmoji: '✨',
+      lengthText: '-',
+      lengthHelper: '-',
+      weightText: '-',
       icon: Icons.circle,
       kind: _FruitKind.berry,
       primaryColor: Color(0xFFE66A8C),
       secondaryColor: Color(0xFFB8325A),
       leafColor: Color(0xFF4F8A4C),
-    );
-  }
-  if (currentWeek <= 12) {
-    return const _BabySizeInfo(
-      name: 'Limao',
+    ),
+    2: _BabySizeInfo(
+      name: 'desenvolvimento inicial',
+      article: 'em',
+      illustrationEmoji: '✨',
+      lengthText: '-',
+      lengthHelper: '-',
+      weightText: '-',
+      icon: Icons.circle,
+      kind: _FruitKind.berry,
+      primaryColor: Color(0xFFE66A8C),
+      secondaryColor: Color(0xFFB8325A),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    3: _BabySizeInfo(
+      name: 'desenvolvimento inicial',
+      article: 'em',
+      illustrationEmoji: '✨',
+      lengthText: '-',
+      lengthHelper: '-',
+      weightText: '-',
+      icon: Icons.circle,
+      kind: _FruitKind.berry,
+      primaryColor: Color(0xFFE66A8C),
+      secondaryColor: Color(0xFFB8325A),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    4: _BabySizeInfo(
+      name: 'semente de papoula',
+      article: 'uma',
+      illustrationEmoji: '🌱',
+      lengthText: '-',
+      lengthHelper: '-',
+      weightText: '-',
+      icon: Icons.grain,
+      kind: _FruitKind.berry,
+      primaryColor: Color(0xFF6D6D6D),
+      secondaryColor: Color(0xFF3E3E3E),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    5: _BabySizeInfo(
+      name: 'semente de gergelim',
+      article: 'uma',
+      illustrationEmoji: '🌾',
+      lengthText: '0.3 cm',
+      weightText: '-',
+      icon: Icons.grain,
+      kind: _FruitKind.berry,
+      primaryColor: Color(0xFFE2C08D),
+      secondaryColor: Color(0xFFC89A63),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    6: _BabySizeInfo(
+      name: 'semente de roma',
+      article: 'uma',
+      illustrationEmoji: '🌱',
+      lengthText: '0.5 cm',
+      weightText: '-',
+      icon: Icons.circle,
+      kind: _FruitKind.berry,
+      primaryColor: Color(0xFFC44343),
+      secondaryColor: Color(0xFF8B2F2F),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    7: _BabySizeInfo(
+      name: 'mirtilo',
       article: 'um',
+      illustrationEmoji: '🫐',
+      lengthText: '1 cm',
+      weightText: '1 g',
+      icon: Icons.circle,
+      kind: _FruitKind.berry,
+      primaryColor: Color(0xFF6D86C9),
+      secondaryColor: Color(0xFF3F5EA8),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    8: _BabySizeInfo(
+      name: 'framboesa',
+      article: 'uma',
+      illustrationEmoji: '🍓',
+      lengthText: '1.6 cm',
+      weightText: '1.3 g',
+      icon: Icons.circle,
+      kind: _FruitKind.berry,
+      primaryColor: Color(0xFFE66A8C),
+      secondaryColor: Color(0xFFB8325A),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    9: _BabySizeInfo(
+      name: 'cereja',
+      article: 'uma',
+      illustrationEmoji: '🍒',
+      lengthText: '2.3 cm',
+      weightText: '2 g',
+      icon: Icons.circle,
+      kind: _FruitKind.berry,
+      primaryColor: Color(0xFFBD2E4A),
+      secondaryColor: Color(0xFF8D1C34),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    10: _BabySizeInfo(
+      name: 'azeitona verde',
+      article: 'uma',
+      illustrationEmoji: '🫒',
+      lengthText: '3.1 cm',
+      weightText: '4 g',
+      icon: Icons.circle,
+      kind: _FruitKind.citrus,
+      primaryColor: Color(0xFFC2C96A),
+      secondaryColor: Color(0xFF8B9A3E),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    11: _BabySizeInfo(
+      name: 'figo',
+      article: 'um',
+      illustrationEmoji: '🟣',
+      lengthText: '4.1 cm',
+      weightText: '8 g',
+      icon: Icons.circle,
+      kind: _FruitKind.eggplant,
+      primaryColor: Color(0xFF8A5FA7),
+      secondaryColor: Color(0xFF5B3A99),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    12: _BabySizeInfo(
+      name: 'limao',
+      article: 'um',
+      illustrationEmoji: '🍋',
+      lengthText: '5.4 cm',
+      weightText: '14 g',
       icon: Icons.circle_outlined,
       kind: _FruitKind.citrus,
       primaryColor: Color(0xFFFFD94D),
       secondaryColor: Color(0xFFF2C500),
       leafColor: Color(0xFF5FA35C),
-    );
-  }
-  if (currentWeek <= 16) {
-    return const _BabySizeInfo(
-      name: 'Abacate',
+    ),
+    13: _BabySizeInfo(
+      name: 'pessego',
       article: 'um',
+      illustrationEmoji: '🍑',
+      lengthText: '7.4 cm',
+      weightText: '24 g',
+      icon: Icons.apple,
+      kind: _FruitKind.mango,
+      primaryColor: Color(0xFFFFB888),
+      secondaryColor: Color(0xFFE87C3D),
+      leafColor: Color(0xFF5E9C55),
+    ),
+    14: _BabySizeInfo(
+      name: 'nectarina',
+      article: 'uma',
+      illustrationEmoji: '🍑',
+      lengthText: '8.7 cm',
+      weightText: '44 g',
+      icon: Icons.apple,
+      kind: _FruitKind.mango,
+      primaryColor: Color(0xFFFFAB85),
+      secondaryColor: Color(0xFFE75F52),
+      leafColor: Color(0xFF5E9C55),
+    ),
+    15: _BabySizeInfo(
+      name: 'maca',
+      article: 'uma',
+      illustrationEmoji: '🍏',
+      lengthText: '10.1 cm',
+      weightText: '70 g',
+      icon: Icons.apple,
+      kind: _FruitKind.mango,
+      primaryColor: Color(0xFFA7D96C),
+      secondaryColor: Color(0xFF6BA73A),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    16: _BabySizeInfo(
+      name: 'abacate',
+      article: 'um',
+      illustrationEmoji: '🥑',
+      lengthText: '11.6 cm',
+      weightText: '100 g',
       icon: Icons.spa,
       kind: _FruitKind.avocado,
       primaryColor: Color(0xFF9AC46A),
       secondaryColor: Color(0xFF5F8D40),
       leafColor: Color(0xFF3F6D3D),
-    );
-  }
-  if (currentWeek <= 20) {
-    return const _BabySizeInfo(
-      name: 'Banana',
+    ),
+    17: _BabySizeInfo(
+      name: 'pera',
+      article: 'uma',
+      illustrationEmoji: '🍐',
+      lengthText: '13 cm',
+      weightText: '142 g',
+      icon: Icons.energy_savings_leaf,
+      kind: _FruitKind.avocado,
+      primaryColor: Color(0xFFB9D75B),
+      secondaryColor: Color(0xFF7FA034),
+      leafColor: Color(0xFF3F6D3D),
+    ),
+    18: _BabySizeInfo(
+      name: 'pimentao',
+      article: 'um',
+      illustrationEmoji: '🫑',
+      lengthText: '14.2 cm',
+      weightText: '190 g',
       icon: Icons.emoji_food_beverage,
+      kind: _FruitKind.banana,
+      primaryColor: Color(0xFFFF8A65),
+      secondaryColor: Color(0xFFE05C3E),
+      leafColor: Color(0xFF4E8A4B),
+    ),
+    19: _BabySizeInfo(
+      name: 'roma',
+      article: 'uma',
+      illustrationEmoji: '🔴',
+      lengthText: '15.3 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '240 g',
+      icon: Icons.circle,
+      kind: _FruitKind.berry,
+      primaryColor: Color(0xFFC44343),
+      secondaryColor: Color(0xFF8B2F2F),
+      leafColor: Color(0xFF4F8A4C),
+    ),
+    20: _BabySizeInfo(
+      name: 'espiga de milho',
+      article: 'uma',
+      illustrationEmoji: '🌽',
+      lengthText: '25.6 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '300 g',
+      icon: Icons.grass,
       kind: _FruitKind.banana,
       primaryColor: Color(0xFFFFE07A),
       secondaryColor: Color(0xFFE4B83A),
       leafColor: Color(0xFF6E9A50),
-    );
-  }
-  if (currentWeek <= 24) {
-    return const _BabySizeInfo(
-      name: 'Manga',
+    ),
+    21: _BabySizeInfo(
+      name: 'toranja',
+      article: 'uma',
+      illustrationEmoji: '🍊',
+      lengthText: '26.7 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '360 g',
+      icon: Icons.circle_outlined,
+      kind: _FruitKind.citrus,
+      primaryColor: Color(0xFFFFB36B),
+      secondaryColor: Color(0xFFE87C3D),
+      leafColor: Color(0xFF5FA35C),
+    ),
+    22: _BabySizeInfo(
+      name: 'abobrinha',
+      article: 'uma',
+      illustrationEmoji: '🥒',
+      lengthText: '27.8 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '430 g',
+      icon: Icons.eco,
+      kind: _FruitKind.avocado,
+      primaryColor: Color(0xFF9AC46A),
+      secondaryColor: Color(0xFF5F8D40),
+      leafColor: Color(0xFF3F6D3D),
+    ),
+    23: _BabySizeInfo(
+      name: 'manga grande',
+      article: 'uma',
+      illustrationEmoji: '🥭',
+      lengthText: '28.8 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '500 g',
       icon: Icons.apple,
       kind: _FruitKind.mango,
       primaryColor: Color(0xFFFFB347),
       secondaryColor: Color(0xFFE87C3D),
       leafColor: Color(0xFF5E9C55),
-    );
-  }
-  if (currentWeek <= 28) {
-    return const _BabySizeInfo(
-      name: 'Berinjela',
-      icon: Icons.eco,
-      kind: _FruitKind.eggplant,
-      primaryColor: Color(0xFF8C66D0),
-      secondaryColor: Color(0xFF5B3A99),
-      leafColor: Color(0xFF58915B),
-    );
-  }
-  if (currentWeek <= 32) {
-    return const _BabySizeInfo(
-      name: 'Coco',
+    ),
+    24: _BabySizeInfo(
+      name: 'mamao papaia',
       article: 'um',
-      icon: Icons.bubble_chart,
-      kind: _FruitKind.coconut,
-      primaryColor: Color(0xFFB78A55),
-      secondaryColor: Color(0xFF8E6337),
-      leafColor: Color(0xFF4E8A4B),
-    );
-  }
-  if (currentWeek <= 36) {
-    return const _BabySizeInfo(
-      name: 'Melao',
-      article: 'um',
+      illustrationEmoji: '🍈',
+      lengthText: '30 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '600 g',
       icon: Icons.local_florist,
       kind: _FruitKind.papaya,
       primaryColor: Color(0xFFFFB36B),
       secondaryColor: Color(0xFFE36D4E),
       leafColor: Color(0xFF5E9E4F),
-    );
+    ),
+    25: _BabySizeInfo(
+      name: 'pomelo',
+      article: 'um',
+      illustrationEmoji: '🍊',
+      lengthText: '34.6 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '670 g',
+      icon: Icons.circle_outlined,
+      kind: _FruitKind.citrus,
+      primaryColor: Color(0xFFFFD94D),
+      secondaryColor: Color(0xFFF2C500),
+      leafColor: Color(0xFF5FA35C),
+    ),
+    26: _BabySizeInfo(
+      name: 'berinjela',
+      article: 'uma',
+      illustrationEmoji: '🍆',
+      lengthText: '35.6 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '760 g',
+      icon: Icons.eco,
+      kind: _FruitKind.eggplant,
+      primaryColor: Color(0xFF8C66D0),
+      secondaryColor: Color(0xFF5B3A99),
+      leafColor: Color(0xFF58915B),
+    ),
+    27: _BabySizeInfo(
+      name: 'couve-flor',
+      article: 'uma',
+      illustrationEmoji: '🥦',
+      lengthText: '36.6 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '880 g',
+      icon: Icons.spa,
+      kind: _FruitKind.avocado,
+      primaryColor: Color(0xFFD6E1BA),
+      secondaryColor: Color(0xFF8E9A77),
+      leafColor: Color(0xFF4E8A4B),
+    ),
+    28: _BabySizeInfo(
+      name: 'abobora japonesa',
+      article: 'uma',
+      illustrationEmoji: '🎃',
+      lengthText: '37.5 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '1.1 kg',
+      icon: Icons.circle,
+      kind: _FruitKind.papaya,
+      primaryColor: Color(0xFFB78A55),
+      secondaryColor: Color(0xFF8E6337),
+      leafColor: Color(0xFF4E8A4B),
+    ),
+    29: _BabySizeInfo(
+      name: 'abobora cabotia',
+      article: 'uma',
+      illustrationEmoji: '🎃',
+      lengthText: '38.6 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '1.2 kg',
+      icon: Icons.circle,
+      kind: _FruitKind.papaya,
+      primaryColor: Color(0xFFFFB36B),
+      secondaryColor: Color(0xFFE36D4E),
+      leafColor: Color(0xFF5E9E4F),
+    ),
+    30: _BabySizeInfo(
+      name: 'penca de bananas',
+      article: 'uma',
+      illustrationEmoji: '🍌',
+      lengthText: '39.9 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '1.3 kg',
+      icon: Icons.emoji_food_beverage,
+      kind: _FruitKind.banana,
+      primaryColor: Color(0xFFFFE07A),
+      secondaryColor: Color(0xFFE4B83A),
+      leafColor: Color(0xFF6E9A50),
+    ),
+    31: _BabySizeInfo(
+      name: 'coco',
+      article: 'um',
+      illustrationEmoji: '🥥',
+      lengthText: '41.1 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '1.5 kg',
+      icon: Icons.bubble_chart,
+      kind: _FruitKind.coconut,
+      primaryColor: Color(0xFFB78A55),
+      secondaryColor: Color(0xFF8E6337),
+      leafColor: Color(0xFF4E8A4B),
+    ),
+    32: _BabySizeInfo(
+      name: 'cacho de uvas',
+      article: 'um',
+      illustrationEmoji: '🍇',
+      lengthText: '42.4 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '1.7 kg',
+      icon: Icons.grain,
+      kind: _FruitKind.berry,
+      primaryColor: Color(0xFF8EC279),
+      secondaryColor: Color(0xFF4A8E4D),
+      leafColor: Color(0xFF3F6D3D),
+    ),
+    33: _BabySizeInfo(
+      name: 'abacaxi',
+      article: 'um',
+      illustrationEmoji: '🍍',
+      lengthText: '43.8 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '2 kg',
+      icon: Icons.local_florist,
+      kind: _FruitKind.papaya,
+      primaryColor: Color(0xFFFFD07A),
+      secondaryColor: Color(0xFFE6A53A),
+      leafColor: Color(0xFF4E8A4B),
+    ),
+    34: _BabySizeInfo(
+      name: 'melao cantalupo',
+      article: 'um',
+      illustrationEmoji: '🍈',
+      lengthText: '45 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '2.2 kg',
+      icon: Icons.local_florist,
+      kind: _FruitKind.papaya,
+      primaryColor: Color(0xFFFFB36B),
+      secondaryColor: Color(0xFFE36D4E),
+      leafColor: Color(0xFF5E9E4F),
+    ),
+    35: _BabySizeInfo(
+      name: 'melao verde',
+      article: 'um',
+      illustrationEmoji: '🍈',
+      lengthText: '46.3 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '2.4 kg',
+      icon: Icons.local_florist,
+      kind: _FruitKind.papaya,
+      primaryColor: Color(0xFFCFE48D),
+      secondaryColor: Color(0xFF8EBE5F),
+      leafColor: Color(0xFF5E9E4F),
+    ),
+    36: _BabySizeInfo(
+      name: 'acelga chinesa',
+      article: 'uma',
+      illustrationEmoji: '🥬',
+      lengthText: '47.4 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '2.6 kg',
+      icon: Icons.eco,
+      kind: _FruitKind.avocado,
+      primaryColor: Color(0xFF9AC46A),
+      secondaryColor: Color(0xFF5F8D40),
+      leafColor: Color(0xFF3F6D3D),
+    ),
+    37: _BabySizeInfo(
+      name: 'coco verde',
+      article: 'um',
+      illustrationEmoji: '🥥',
+      lengthText: '48.5 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '2.9 kg',
+      icon: Icons.bubble_chart,
+      kind: _FruitKind.coconut,
+      primaryColor: Color(0xFFA4CC79),
+      secondaryColor: Color(0xFF5D9B55),
+      leafColor: Color(0xFF3F6D3D),
+    ),
+    38: _BabySizeInfo(
+      name: 'repolho grande',
+      article: 'um',
+      illustrationEmoji: '🥬',
+      lengthText: '49.8 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '3.1 kg',
+      icon: Icons.eco,
+      kind: _FruitKind.avocado,
+      primaryColor: Color(0xFFA7D96C),
+      secondaryColor: Color(0xFF6BA73A),
+      leafColor: Color(0xFF3F6D3D),
+    ),
+    39: _BabySizeInfo(
+      name: 'abobora pequena',
+      article: 'uma',
+      illustrationEmoji: '🎃',
+      lengthText: '50.6 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '3.3 kg',
+      icon: Icons.circle,
+      kind: _FruitKind.papaya,
+      primaryColor: Color(0xFFFFB36B),
+      secondaryColor: Color(0xFFE36D4E),
+      leafColor: Color(0xFF5E9E4F),
+    ),
+    40: _BabySizeInfo(
+      name: 'melancia',
+      article: 'uma',
+      illustrationEmoji: '🍉',
+      lengthText: '51.2 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '3.5 kg',
+      icon: Icons.brightness_1,
+      kind: _FruitKind.watermelon,
+      primaryColor: Color(0xFF6FCF97),
+      secondaryColor: Color(0xFF2F9E63),
+      leafColor: Color(0xFF4E8A4B),
+    ),
+    41: _BabySizeInfo(
+      name: 'melancia',
+      article: 'uma',
+      illustrationEmoji: '🍉',
+      lengthText: '51.2 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '3.5 kg',
+      icon: Icons.brightness_1,
+      kind: _FruitKind.watermelon,
+      primaryColor: Color(0xFF6FCF97),
+      secondaryColor: Color(0xFF2F9E63),
+      leafColor: Color(0xFF4E8A4B),
+    ),
+    42: _BabySizeInfo(
+      name: 'melancia',
+      article: 'uma',
+      illustrationEmoji: '🍉',
+      lengthText: '51.2 cm',
+      lengthHelper: 'da cabeca aos pes',
+      weightText: '3.5 kg',
+      icon: Icons.brightness_1,
+      kind: _FruitKind.watermelon,
+      primaryColor: Color(0xFF6FCF97),
+      secondaryColor: Color(0xFF2F9E63),
+      leafColor: Color(0xFF4E8A4B),
+    ),
+  };
+
+  final weekly = weeklyData[currentWeek];
+  if (weekly != null) {
+    return weekly;
   }
+
   return const _BabySizeInfo(
-    name: 'Melancia pequena',
+    name: 'melancia',
+    article: 'uma',
+    illustrationEmoji: '🍉',
+    lengthText: '51.2 cm',
+    lengthHelper: 'da cabeca aos pes',
+    weightText: '3.5 kg',
     icon: Icons.brightness_1,
     kind: _FruitKind.watermelon,
     primaryColor: Color(0xFF6FCF97),
     secondaryColor: Color(0xFF2F9E63),
     leafColor: Color(0xFF4E8A4B),
   );
+}
+
+String _trimesterForWeek(int currentWeek) {
+  if (currentWeek <= 13) return '1o trimestre';
+  if (currentWeek <= 27) return '2o trimestre';
+  return '3o trimestre';
 }
 
 enum _FruitKind {
@@ -3302,12 +4392,86 @@ enum _FruitKind {
 }
 
 class _FruitIllustration extends StatelessWidget {
-  const _FruitIllustration({required this.info});
+  const _FruitIllustration({required this.info, required this.week});
 
   final _BabySizeInfo info;
+  final int week;
 
   @override
   Widget build(BuildContext context) {
+    final assetPath = _assetPathForWeek(week);
+
+    if (assetPath != null) {
+      return Center(
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(20),
+          child: SizedBox(
+            width: 110,
+            height: 110,
+            child: Image.asset(
+              assetPath,
+              fit: BoxFit.cover,
+              alignment: Alignment.topCenter,
+              errorBuilder: (_, _, _) => _buildEmojiFallback(),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return _buildEmojiFallback();
+  }
+
+  String? _assetPathForWeek(int currentWeek) {
+    const weekImageMap = <int, String>{
+      1: 'src/images/1 semana-Photoroom.png',
+      2: 'src/images/2 semanas-Photoroom.png',
+      3: 'src/images/3 semanas-Photoroom.png',
+      4: 'src/images/4 semanas-Photoroom.png',
+      5: 'src/images/5 semanas-Photoroom.png',
+      6: 'src/images/6 semanas-Photoroom.png',
+      7: 'src/images/7 semanas-Photoroom.png',
+      8: 'src/images/8 semanas-Photoroom.png',
+      9: 'src/images/9 semanas-Photoroom.png',
+      10: 'src/images/10 semanas-Photoroom.png',
+      11: 'src/images/11 semanas-Photoroom.png',
+      12: 'src/images/12 semanas-Photoroom.png',
+      13: 'src/images/13 semanas-Photoroom.png',
+      14: 'src/images/14 semanas-Photoroom.png',
+      15: 'src/images/15 semanas-Photoroom.png',
+      16: 'src/images/16 semanas-Photoroom.png',
+      17: 'src/images/17 semanas-Photoroom.png',
+      18: 'src/images/18 semanas-Photoroom.png',
+      19: 'src/images/19 semanas-Photoroom.png',
+      20: 'src/images/20 semanas-Photoroom.png',
+      21: 'src/images/21 semanas-Photoroom.png',
+      22: 'src/images/22 semanas-Photoroom.png',
+      23: 'src/images/23 semanas-Photoroom.png',
+      24: 'src/images/24 semanas-Photoroom.png',
+      25: 'src/images/25 semanas-Photoroom.png',
+      26: 'src/images/26 semanas-Photoroom.png',
+      27: 'src/images/27 semanas-Photoroom.png',
+      28: 'src/images/28 semanas-Photoroom.png',
+      29: 'src/images/29 semanas-Photoroom.png',
+      30: 'src/images/30 semanas-Photoroom.png',
+      31: 'src/images/31 semanas-Photoroom.png',
+      32: 'src/images/32 semanas-Photoroom.png',
+      33: 'src/images/33 semanas-Photoroom.png',
+      34: 'src/images/34 semanas-Photoroom.png',
+      35: 'src/images/35 semanas-Photoroom.png',
+      36: 'src/images/36 semanas-Photoroom.png',
+      37: 'src/images/37 semanas-Photoroom.png',
+      38: 'src/images/38 semanas-Photoroom.png',
+      39: 'src/images/39 semanas-Photoroom.png',
+      40: 'src/images/40 semanas-Photoroom.png',
+      41: 'src/images/41 semanas-Photoroom.png',
+      42: 'src/images/42 semanas-Photoroom.png',
+    };
+
+    return weekImageMap[currentWeek];
+  }
+
+  Widget _buildEmojiFallback() {
     return Center(
       child: Container(
         width: 94,
@@ -3318,7 +4482,7 @@ class _FruitIllustration extends StatelessWidget {
         ),
         alignment: Alignment.center,
         child: Text(
-          _fallbackEmoji(info.kind),
+          info.illustrationEmoji ?? _fallbackEmoji(info.kind),
           style: const TextStyle(fontSize: 58),
         ),
       ),

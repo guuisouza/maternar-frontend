@@ -1,3 +1,6 @@
+import 'package:gestcare_app/app_session.dart';
+import 'package:gestcare_app/backend_api.dart';
+
 class HomeTipData {
   const HomeTipData({
     required this.iconKey,
@@ -169,5 +172,69 @@ class MockHomeDashboardDataSource implements HomeDashboardDataSource {
       recommendedArticleTitle: 'Preparando o quarto: o que realmente importa?',
       recommendedArticleRoute: '/education',
     );
+  }
+}
+
+class ApiHomeDashboardDataSource implements HomeDashboardDataSource {
+  const ApiHomeDashboardDataSource({
+    this.api = const BackendApi(),
+    this.fallback = const MockHomeDashboardDataSource(),
+  });
+
+  final BackendApi api;
+  final HomeDashboardDataSource fallback;
+
+  @override
+  Future<HomeDashboardData> fetch() async {
+    final localData = await fallback.fetch();
+    final token = AppSession.token;
+    final localDueDate = AppSession.dueDate;
+
+    if (token == null || token.isEmpty) {
+      if (localDueDate != null) {
+        return HomeDashboardData(
+          userName: AppSession.profileName ?? localData.userName,
+          currentWeek: AppSession.currentWeek ?? localData.currentWeek,
+          daysToBirth: AppSession.daysToBirth ?? localData.daysToBirth,
+          dailyTips: localData.dailyTips,
+          quickActions: localData.quickActions,
+          recommendedArticleTitle: localData.recommendedArticleTitle,
+          recommendedArticleRoute: localData.recommendedArticleRoute,
+        );
+      }
+      return localData;
+    }
+
+    try {
+      final profile = await api.profile(token);
+      await AppSession.saveProfile(
+        name: profile.name,
+        email: profile.email,
+        dueDate: profile.birthDate,
+      );
+
+      return HomeDashboardData(
+        userName: profile.name,
+        currentWeek: AppSession.currentWeek ?? localData.currentWeek,
+        daysToBirth: AppSession.daysToBirth ?? localData.daysToBirth,
+        dailyTips: localData.dailyTips,
+        quickActions: localData.quickActions,
+        recommendedArticleTitle: localData.recommendedArticleTitle,
+        recommendedArticleRoute: localData.recommendedArticleRoute,
+      );
+    } catch (_) {
+      if (localDueDate != null) {
+        return HomeDashboardData(
+          userName: AppSession.profileName ?? localData.userName,
+          currentWeek: AppSession.currentWeek ?? localData.currentWeek,
+          daysToBirth: AppSession.daysToBirth ?? localData.daysToBirth,
+          dailyTips: localData.dailyTips,
+          quickActions: localData.quickActions,
+          recommendedArticleTitle: localData.recommendedArticleTitle,
+          recommendedArticleRoute: localData.recommendedArticleRoute,
+        );
+      }
+      return localData;
+    }
   }
 }
