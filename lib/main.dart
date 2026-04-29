@@ -3,6 +3,7 @@ import 'package:gestcare_app/app_session.dart';
 import 'package:gestcare_app/backend_api.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:gestcare_app/home_dashboard_data_source.dart';
+import 'viacep_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -170,6 +171,10 @@ class _SignupScreenState extends State<SignupScreen> {
   final TextEditingController _nameController = TextEditingController();
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _phoneController = TextEditingController();
+  final TextEditingController _zipCodeController = TextEditingController();
+  final TextEditingController _streetController = TextEditingController();
+  final TextEditingController _neighborhoodController = TextEditingController();
+  final TextEditingController _cityController = TextEditingController();
   final TextEditingController _birthDateController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _confirmPasswordController =
@@ -222,15 +227,21 @@ class _SignupScreenState extends State<SignupScreen> {
     super.initState();
     _passwordController.addListener(_onPasswordChanged);
     _phoneController.addListener(_onPhoneChanged);
+    _zipCodeController.addListener(_onZipChanged);
   }
 
   @override
   void dispose() {
     _passwordController.removeListener(_onPasswordChanged);
     _phoneController.removeListener(_onPhoneChanged);
+    _zipCodeController.removeListener(_onZipChanged);
     _nameController.dispose();
     _emailController.dispose();
     _phoneController.dispose();
+    _zipCodeController.dispose();
+    _streetController.dispose();
+    _neighborhoodController.dispose();
+    _cityController.dispose();
     _birthDateController.dispose();
     _passwordController.dispose();
     _confirmPasswordController.dispose();
@@ -328,6 +339,53 @@ class _SignupScreenState extends State<SignupScreen> {
     final isoMonth = parsed.month.toString().padLeft(2, '0');
     final isoDay = parsed.day.toString().padLeft(2, '0');
     return '${parsed.year}-$isoMonth-$isoDay';
+  }
+
+  String? _validateZip(String? value) {
+    final text = (value ?? '').replaceAll(RegExp(r'\D'), '');
+    if (text.isEmpty) return 'Informe seu CEP.';
+    if (text.length != 8) return 'CEP invalido. Use 8 digitos.';
+    return null;
+  }
+
+  bool _isLookingUpCep = false;
+  final ViaCepService _viaCep = ViaCepService();
+  bool _autoFillCep = true;
+
+  void _onZipChanged() {
+    final digits = _zipCodeController.text.replaceAll(RegExp(r'\D'), '');
+    if (_autoFillCep && digits.length == 8 && !_isLookingUpCep) {
+      _lookupCep(digits);
+    }
+    if (digits.length < 8) {
+      _streetController.text = '';
+      _neighborhoodController.text = '';
+      _cityController.text = '';
+    }
+  }
+
+  Future<void> _lookupCep(String digits) async {
+    _isLookingUpCep = true;
+    try {
+      final data = await _viaCep.fetch(digits);
+      if (mounted) {
+        setState(() {
+          _streetController.text = data['street'] ?? '';
+          _neighborhoodController.text = data['neighborhood'] ?? '';
+          _cityController.text = '${data['city'] ?? ''} ${data['state'] ?? ''}'.trim();
+        });
+      }
+    } on ApiClientException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Erro ao consultar ViaCEP.')));
+      }
+    } finally {
+      _isLookingUpCep = false;
+    }
   }
 
   String? _validateName(String? value) {
@@ -508,6 +566,66 @@ class _SignupScreenState extends State<SignupScreen> {
                   ),
                 ),
               ),
+              LabeledField(
+                label: 'CEP',
+                child: TextFormField(
+                  controller: _zipCodeController,
+                  keyboardType: TextInputType.number,
+                  textInputAction: TextInputAction.next,
+                  validator: _validateZip,
+                  decoration: InputDecoration(
+                    hintText: 'Ex: 01001-000',
+                    suffixIcon: _isLookingUpCep
+                        ? const Padding(
+                            padding: EdgeInsets.all(12.0),
+                            child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                          )
+                        : IconButton(
+                            onPressed: () {
+                              final digits = _zipCodeController.text.replaceAll(RegExp(r'\D'), '');
+                              if (digits.length == 8) _lookupCep(digits);
+                            },
+                            icon: const Icon(Icons.search),
+                          ),
+                  ),
+                ),
+              ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  const Text('Preenchimento automático'),
+                  Switch(
+                    value: _autoFillCep,
+                    onChanged: (v) => setState(() => _autoFillCep = v),
+                  ),
+                ],
+              ),
+              if (_streetController.text.isNotEmpty || _neighborhoodController.text.isNotEmpty || _cityController.text.isNotEmpty) ...[
+                LabeledField(
+                  label: 'Logradouro',
+                  child: TextFormField(
+                    controller: _streetController,
+                    readOnly: true,
+                    decoration: const InputDecoration(hintText: ''),
+                  ),
+                ),
+                LabeledField(
+                  label: 'Bairro',
+                  child: TextFormField(
+                    controller: _neighborhoodController,
+                    readOnly: true,
+                    decoration: const InputDecoration(hintText: ''),
+                  ),
+                ),
+                LabeledField(
+                  label: 'Cidade/UF',
+                  child: TextFormField(
+                    controller: _cityController,
+                    readOnly: true,
+                    decoration: const InputDecoration(hintText: ''),
+                  ),
+                ),
+              ],
               LabeledField(
                 label: 'Data prevista do parto',
                 child: TextFormField(
